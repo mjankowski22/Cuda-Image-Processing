@@ -487,7 +487,6 @@ int main()
                 cpu_output = new unsigned char[width * height * channels];
                 cudaMalloc(&dev_output, width * height * channels);
                 negateImageCUDA << <dimGrid, dimBlock >> > (dev_img, dev_output, width, height, channels);
-                //cudaDeviceSynchronize(); // Ensure that the GPU kernel execution is complete
                 cpu_start = std::chrono::high_resolution_clock::now();
                 negateImageCPU(img, cpu_output, width, height, channels);
                 cpu_stop = std::chrono::high_resolution_clock::now();
