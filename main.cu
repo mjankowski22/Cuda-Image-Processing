@@ -1,3 +1,4 @@
+
 #include <iostream>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -7,6 +8,101 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+
+const int KERNEL_SIZE = 15;
+const float SIGMA = 5.0f;
+
+__device__ float gaussian(int x, int y) {
+    return exp(-((x * x + y * y) / (2 * SIGMA * SIGMA))) / (2 * M_PI * SIGMA * SIGMA);
+}
+
+
+__global__ void applyGaussianBlurCUDA(unsigned char* input, unsigned char* output, int width, int height, int channels) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < width && y < height) {
+        float blur_value[3] = {0.0f, 0.0f, 0.0f};
+        int half_kernel = KERNEL_SIZE / 2;
+
+        for (int ky = -half_kernel; ky <= half_kernel; ++ky) {
+            for (int kx = -half_kernel; kx <= half_kernel; ++kx) {
+                int nx = min(max(x + kx, 0), width - 1);
+                int ny = min(max(y + ky, 0), height - 1);
+                unsigned char* pixel = input + (ny * width + nx) * channels;
+                float weight = gaussian(abs(kx), abs(ky));
+                for (int c = 0; c < channels; ++c) {
+                    blur_value[c] += weight * pixel[c];
+                }
+            }
+        }
+
+        unsigned char* outPixel = output + (y * width + x) * channels;
+        for (int c = 0; c < channels; ++c) {
+            outPixel[c] = static_cast<unsigned char>(blur_value[c]);
+        }
+    }
+}
+
+void applyGaussianBlurCPU(unsigned char* img, unsigned char* output, int width, int height, int channels) {
+    const int KERNEL_SIZE = 15;
+    const float SIGMA = 5.0f;
+    
+    float kernel[KERNEL_SIZE][KERNEL_SIZE];
+    float sum = 0.0f;
+
+    for (int y = -KERNEL_SIZE / 2; y <= KERNEL_SIZE / 2; ++y) {
+        for (int x = -KERNEL_SIZE / 2; x <= KERNEL_SIZE / 2; ++x) {
+            float value = exp(-((x * x + y * y) / (2 * SIGMA * SIGMA))) / (2 * M_PI * SIGMA * SIGMA);
+            kernel[y + KERNEL_SIZE / 2][x + KERNEL_SIZE / 2] = value;
+            sum += value;
+        }
+    }
+
+    for (int y = 0; y < KERNEL_SIZE; ++y) {
+        for (int x = 0; x < KERNEL_SIZE; ++x) {
+            kernel[y][x] /= sum;
+        }
+    }
+
+
+    for (int y = KERNEL_SIZE / 2; y < height - KERNEL_SIZE / 2; ++y) {
+        for (int x = KERNEL_SIZE / 2; x < width - KERNEL_SIZE / 2; ++x) {
+            for (int c = 0; c < channels; ++c) {
+                float sum = 0.0f;
+                for (int ky = -KERNEL_SIZE / 2; ky <= KERNEL_SIZE / 2; ++ky) {
+                    for (int kx = -KERNEL_SIZE / 2; kx <= KERNEL_SIZE / 2; ++kx) {
+                        sum += img[((y + ky) * width + (x + kx)) * channels + c] * kernel[ky + KERNEL_SIZE / 2][kx + KERNEL_SIZE / 2];
+                    }
+                }
+                output[(y * width + x) * channels + c] = static_cast<unsigned char>(sum);
+            }
+        }
+    }
+}
+
+__global__ void negateImageCUDA(unsigned char* input, unsigned char* output, int width, int height, int channels) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < width && y < height) {
+        int index = (y * width + x) * channels;
+        for (int c = 0; c < channels; ++c) {
+            output[index + c] = 255 - input[index + c];
+        }
+    }
+}
+
+void negateImageCPU(unsigned char* input, unsigned char* output, int width, int height, int channels) {
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int index = (y * width + x) * channels;
+            for (int c = 0; c < channels; ++c) {
+                output[index + c] = 255 - input[index + c];
+            }
+        }
+    }
+}
 
 
 __global__ void resizeImageCUDA(unsigned char* input, unsigned char* output, int inWidth, int inHeight, int channels, int outWidth, int outHeight) {
@@ -104,7 +200,7 @@ __global__ void translateImageCUDA(unsigned char* input, unsigned char* output, 
 
     if (x < width && y < height) {
         int input_index = (y * width + x) * channels;
-        int output_index = ((y)*width + (x + dx)) * channels;
+        int output_index = ((y) * width + (x + dx)) * channels;
 
         if (output_index >= 0 && output_index < width * height * channels) {
             for (int c = 0; c < channels; ++c) {
@@ -158,8 +254,8 @@ __global__ void applySobelCUDA(unsigned char* img, unsigned char* output, int wi
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x > 0 && x < width - 1 && y > 0 && y < height - 1) {
-        int gx[3][3] = { {-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1} };
-        int gy[3][3] = { {-1, -2, -1}, {0, 0, 0}, {1, 2, 1} };
+        int gx[3][3] = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}};
+        int gy[3][3] = {{-1, -2, -1}, {0, 0, 0}, {1, 2, 1}};
         int sumX = 0, sumY = 0;
 
         for (int ky = -1; ky <= 1; ky++) {
@@ -181,8 +277,8 @@ __global__ void applySobelCUDA(unsigned char* img, unsigned char* output, int wi
 }
 
 void applySobel(unsigned char* img, unsigned char* output, int width, int height, int channels) {
-    int gx[3][3] = { {-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1} };
-    int gy[3][3] = { {-1, -2, -1}, {0, 0, 0}, {1, 2, 1} };
+    int gx[3][3] = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}};
+    int gy[3][3] = {{-1, -2, -1}, {0, 0, 0}, {1, 2, 1}};
 
     for (int y = 1; y < height - 1; ++y) {
         for (int x = 1; x < width - 1; ++x) {
@@ -209,7 +305,7 @@ void applyBlur(unsigned char* img, unsigned char* output, int width, int height,
 
     for (int y = 1; y < height - 1; ++y) {
         for (int x = 1; x < width - 1; ++x) {
-            unsigned int sum[3] = { 0,0,0 };
+            unsigned int sum[3] = {0,0,0};
 
             for (int ky = -1; ky <= 1; ky++) {
                 for (int kx = -1; kx <= 1; kx++) {
@@ -228,7 +324,7 @@ void applyBlur(unsigned char* img, unsigned char* output, int width, int height,
 
             unsigned char* outPixel = output + (y * width + x) * channels;
             for (int c = 0; c < channels; c++) {
-                outPixel[c] = (unsigned char)(sum[c] / 9);
+                  outPixel[c] = (unsigned char) (sum[c] / 9);
             }
         }
     }
@@ -239,7 +335,7 @@ __global__ void applyBlurCUDA(unsigned char* img, unsigned char* output, int wid
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x >= 1 && y >= 1 && x < width - 1 && y < height - 1) {
-        unsigned int sum[3] = { 0, 0, 0 };
+        unsigned int sum[3] = {0, 0, 0};
 
         for (int ky = -1; ky <= 1; ky++) {
             for (int kx = -1; kx <= 1; kx++) {
@@ -277,31 +373,33 @@ int main()
         std::cout << "4. Resize" << std::endl;
         std::cout << "5. Rotate 180deg" << std::endl;
         std::cout << "6. Translate" << std::endl;
-        std::cout << "7. Exit" << std::endl;
+        std::cout << "7. Negative" << std::endl;
+        std::cout << "8. Gaussian Filter" << std::endl;
+        std::cout << "9. Exit" << std::endl;
         std::cout << "Choose option: ";
 
         int choice;
         std::cin >> choice;
 
 
-        int newWidth, newHeight;
-        int dX, dY;
+        int newWidth,newHeight;
+        int dX,dY;
 
-        if (choice == 4) {
-            std::cout << "New width: " << std::endl;
-            std::cin >> newWidth;
-            std::cout << "New height: " << std::endl;
-            std::cin >> newHeight;
+        if(choice == 4){
+          std::cout<<"New width: "<<std::endl;
+          std::cin>>newWidth;
+          std::cout<<"New height: "<<std::endl;
+          std::cin>>newHeight;
         }
 
 
-        if (choice == 6) {
-            std::cout << "dx: " << std::endl;
-            std::cin >> dX;
+        if(choice == 6){
+          std::cout<<"dx: "<<std::endl;
+          std::cin>>dX;
         }
 
-        if (choice == 7) {
-            return 0;
+        if(choice==9){
+          return 0;
         }
 
         std::string input_file_name;
@@ -318,79 +416,97 @@ int main()
 
 
 
-        unsigned char* dev_img, * dev_output;
+        unsigned char *dev_img, *dev_output;
 
 
         dim3 dimBlock(16, 16);
         dim3 dimGrid((width + dimBlock.x - 1) / dimBlock.x, (height + dimBlock.y - 1) / dimBlock.y);
         unsigned char* cpu_output;
-        std::chrono::high_resolution_clock::time_point cpu_start, cpu_stop, gpu_start, gpu_stop;
+        std::chrono::high_resolution_clock::time_point cpu_start,cpu_stop,gpu_start,gpu_stop;
         gpu_start = std::chrono::high_resolution_clock::now();
         cudaMalloc(&dev_img, width * height * channels);
 
 
         cudaMemcpy(dev_img, img, width * height * channels, cudaMemcpyHostToDevice);
         switch (choice) {
-        case 1:
-            cpu_output = new unsigned char[width * height * channels];
-            cudaMalloc(&dev_output, width * height * channels);
-            toGrayscaleCUDA << <dimGrid, dimBlock >> > (dev_img, width, height, channels);
-            applySobelCUDA << <dimGrid, dimBlock >> > (dev_img, dev_output, width, height, channels);
-            cpu_start = std::chrono::high_resolution_clock::now();
-            toGrayscale(img, width, height, channels);
-            applySobel(img, cpu_output, width, height, channels);
-            cpu_stop = std::chrono::high_resolution_clock::now();
-            break;
-        case 2:
-            cpu_output = new unsigned char[width * height * channels];
-            cudaMalloc(&dev_output, width * height * channels);
-            applyBlurCUDA << <dimGrid, dimBlock >> > (dev_img, dev_output, width, height, channels);
-            cpu_start = std::chrono::high_resolution_clock::now();
-            applyBlur(img, cpu_output, width, height, channels);
-            cpu_stop = std::chrono::high_resolution_clock::now();
-            break;
-        case 3:
-            cpu_output = new unsigned char[width * height * channels];
-            cudaMalloc(&dev_output, width * height * channels);
-            toGrayscaleCUDA << <dimGrid, dimBlock >> > (dev_img, width, height, channels);
-            dev_output = dev_img;
-            cpu_start = std::chrono::high_resolution_clock::now();
-            toGrayscale(img, width, height, channels);
-            cpu_stop = std::chrono::high_resolution_clock::now();
-            break;
-        case 4:
-            cpu_output = new unsigned char[newWidth * newHeight * channels];
-            cudaMalloc(&dev_output, newWidth * newHeight * channels);
-            resizeImageCUDA << <dimGrid, dimBlock >> > (dev_img, dev_output, width, height, channels, newWidth, newHeight);
-            cpu_start = std::chrono::high_resolution_clock::now();
-            toGrayscale(img, width, height, channels);
-            cpu_stop = std::chrono::high_resolution_clock::now();
-            resizeImageCPU(img, cpu_output, width, height, channels, newWidth, newHeight);
-            width = newWidth;
-            height = newHeight;
-            break;
-        case 5:
-            cpu_output = new unsigned char[width * height * channels];
-            cudaMalloc(&dev_output, width * height * channels);
-            rotate180CUDA << <dimGrid, dimBlock >> > (dev_img, dev_output, width, height, channels);
-            cpu_start = std::chrono::high_resolution_clock::now();
-            rotate180_CPU(img, cpu_output, width, height, channels);
-            cpu_stop = std::chrono::high_resolution_clock::now();
-            break;
-        case 6:
-            cpu_output = new unsigned char[width * height * channels];
-            cudaMalloc(&dev_output, width * height * channels);
-            translateImageCUDA << <dimGrid, dimBlock >> > (dev_img, dev_output, width, height, channels, dX);
-            cpu_start = std::chrono::high_resolution_clock::now();
-            translateImageCPU(img, cpu_output, width, height, channels, dX);
-            cpu_stop = std::chrono::high_resolution_clock::now();
-            break;
-        case 7:
-            std::cout << "Wyjście z programu." << std::endl;
-            return 0;
-        default:
-            std::cout << "Nieprawidłowa opcja. Spróbuj ponownie." << std::endl;
-            break;
+            case 1:
+                cpu_output = new unsigned char[width * height * channels];
+                cudaMalloc(&dev_output, width * height * channels);
+                toGrayscaleCUDA<<<dimGrid, dimBlock>>>(dev_img, width, height, channels);
+                applySobelCUDA<<<dimGrid, dimBlock>>>(dev_img, dev_output, width, height, channels);
+                cpu_start = std::chrono::high_resolution_clock::now();
+                toGrayscale(img,width,height,channels);
+                applySobel(img,cpu_output,width,height,channels);
+                cpu_stop = std::chrono::high_resolution_clock::now();
+                break;
+            case 2:
+                cpu_output = new unsigned char[width * height * channels];
+                cudaMalloc(&dev_output, width * height * channels);
+                applyBlurCUDA<<<dimGrid, dimBlock>>>(dev_img, dev_output, width, height, channels);
+                cpu_start = std::chrono::high_resolution_clock::now();
+                applyBlur(img,cpu_output,width,height,channels);
+                cpu_stop = std::chrono::high_resolution_clock::now();
+                break;
+            case 3:
+                cpu_output = new unsigned char[width * height * channels];
+                cudaMalloc(&dev_output, width * height * channels);
+                toGrayscaleCUDA<<<dimGrid, dimBlock>>>(dev_img,width, height, channels);
+                dev_output = dev_img;
+                cpu_start = std::chrono::high_resolution_clock::now();
+                toGrayscale(img,width,height,channels);
+                cpu_stop = std::chrono::high_resolution_clock::now();
+                break;
+            case 4:
+                cpu_output = new unsigned char[newWidth * newHeight * channels];
+                cudaMalloc(&dev_output, newWidth * newHeight * channels);
+                resizeImageCUDA<<<dimGrid,dimBlock>>>(dev_img,dev_output,width,height, channels, newWidth, newHeight);
+                cpu_start = std::chrono::high_resolution_clock::now();
+                toGrayscale(img,width,height,channels);
+                cpu_stop = std::chrono::high_resolution_clock::now();
+                resizeImageCPU(img, cpu_output, width, height, channels, newWidth,newHeight);
+                width = newWidth;
+                height = newHeight;
+                break;
+            case 5:
+                cpu_output = new unsigned char[width * height * channels];
+                cudaMalloc(&dev_output, width * height * channels);
+                rotate180CUDA<<<dimGrid, dimBlock>>>(dev_img,dev_output,width, height, channels);
+                cpu_start = std::chrono::high_resolution_clock::now();
+                rotate180_CPU(img,cpu_output,width,height,channels);
+                cpu_stop = std::chrono::high_resolution_clock::now();
+                break;
+            case 6:
+                cpu_output = new unsigned char[width * height * channels];
+                cudaMalloc(&dev_output, width * height*channels);
+                translateImageCUDA<<<dimGrid,dimBlock>>>(dev_img,dev_output,width,height, channels, dX);
+                cpu_start = std::chrono::high_resolution_clock::now();
+                translateImageCPU(img,cpu_output,width,height,channels,dX);
+                cpu_stop = std::chrono::high_resolution_clock::now();
+                break;
+            case 7:
+                cpu_output = new unsigned char[width * height * channels];
+                cudaMalloc(&dev_output, width * height * channels);
+                negateImageCUDA << <dimGrid, dimBlock >> > (dev_img, dev_output, width, height, channels);
+                //cudaDeviceSynchronize(); // Ensure that the GPU kernel execution is complete
+                cpu_start = std::chrono::high_resolution_clock::now();
+                negateImageCPU(img, cpu_output, width, height, channels);
+                cpu_stop = std::chrono::high_resolution_clock::now();
+                break;
+            case 8:
+                cpu_output = new unsigned char[width * height * channels];
+                cudaMalloc(&dev_output, width * height * channels);
+                applyGaussianBlurCUDA<<<dimGrid, dimBlock>>>(dev_img, dev_output, width, height, channels);
+                cpu_start = std::chrono::high_resolution_clock::now();
+                applyGaussianBlurCPU(img, cpu_output, width, height, channels);
+                cpu_stop = std::chrono::high_resolution_clock::now();
+                break;
+            case 9:
+                std::cout << "Wyjście z programu." << std::endl;
+                return 0;
+            default:
+                std::cout << "Nieprawidłowa opcja. Spróbuj ponownie." << std::endl;
+                break;
+
         }
         unsigned char* output = new unsigned char[width * height * channels];
         cudaMemcpy(output, dev_output, width * height * channels, cudaMemcpyDeviceToHost);
